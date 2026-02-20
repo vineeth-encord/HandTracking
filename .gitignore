@@ -1,0 +1,17 @@
+# Model file (download separately — see README)
+*.task
+
+# Output videos (generated artifacts)
+*_tracked.*
+
+# Matplotlib cache
+fontlist*.json
+matplotlib-tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
