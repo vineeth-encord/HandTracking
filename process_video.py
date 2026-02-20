@@ -1,7 +1,7 @@
 """
-Hand Tracking Video Pipeline
------------------------------
-Process video files through MediaPipe hand tracking and output
+Hand Tracking Video Pipeline (WiLoR — CVPR 2025)
+--------------------------------------------------
+Process video files through WiLoR hand tracking and output
 wireframe overlays of detected hands.
 
 Usage:
@@ -10,11 +10,15 @@ Usage:
     python process_video.py input.mp4 --mode wireframe
     python process_video.py videos/           # batch process a directory
     python process_video.py videos/ --output tracked_videos/
+
+Setup (run once):
+    pip install torch torchvision
+    pip install git+https://github.com/warmshao/WiLoR-mini
+    pip install opencv-python tqdm
 """
 
 import argparse
 import sys
-import urllib.request
 from pathlib import Path
 
 import cv2
@@ -22,57 +26,51 @@ import numpy as np
 from tqdm import tqdm
 
 try:
-    import mediapipe as mp
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision as mp_vision
+    import torch
+    from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
+        WiLorHandPose3dEstimationPipeline,
+    )
 except ImportError:
-    print("[ERROR] mediapipe not installed. Run: pip install mediapipe", file=sys.stderr)
+    print("[ERROR] Required packages not installed. Run:", file=sys.stderr)
+    print("  pip install torch torchvision", file=sys.stderr)
+    print("  pip install git+https://github.com/warmshao/WiLoR-mini", file=sys.stderr)
     sys.exit(1)
 
-# ── Hand skeleton connections (MediaPipe 21-landmark layout) ──────────────────
+# ── Hand skeleton connections (MediaPipe/WiLoR 21-landmark layout) ────────────
 HAND_CONNECTIONS = [
-    (0, 1),  (1, 2),  (2, 3),  (3, 4),     # Thumb
-    (0, 5),  (5, 6),  (6, 7),  (7, 8),     # Index finger
-    (0, 9),  (9, 10), (10, 11),(11, 12),   # Middle finger
-    (0, 13),(13, 14),(14, 15),(15, 16),    # Ring finger
-    (0, 17),(17, 18),(18, 19),(19, 20),    # Pinky
-    (5, 9), (9, 13),(13, 17),              # Palm knuckle connections
+    (0, 1),  (1, 2),  (2, 3),  (3, 4),      # Thumb
+    (0, 5),  (5, 6),  (6, 7),  (7, 8),      # Index finger
+    (0, 9),  (9, 10), (10, 11),(11, 12),    # Middle finger
+    (0, 13),(13, 14),(14, 15),(15, 16),     # Ring finger
+    (0, 17),(17, 18),(18, 19),(19, 20),     # Pinky
+    (5, 9), (9, 13),(13, 17),               # Palm knuckle connections
 ]
 
-MODEL_URL  = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-)
-MODEL_PATH = Path(__file__).parent / "hand_landmarker.task"
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
-# ── Model management ──────────────────────────────────────────────────────────
+# ── Device detection ──────────────────────────────────────────────────────────
 
-def ensure_model() -> str:
-    """Return path to the hand landmark model, downloading it if needed."""
-    if MODEL_PATH.exists():
-        return str(MODEL_PATH)
-
-    print(f"Hand landmark model not found at {MODEL_PATH}")
-    print(f"Downloading (~29 MB) from Google…")
-    try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("Model downloaded successfully.\n")
-    except Exception as exc:
-        print(f"\n[ERROR] Auto-download failed: {exc}", file=sys.stderr)
-        print("Please download the model manually and place it next to process_video.py:", file=sys.stderr)
-        print(f"  curl -o '{MODEL_PATH}' '{MODEL_URL}'", file=sys.stderr)
-        sys.exit(1)
-
-    return str(MODEL_PATH)
+def get_device() -> str:
+    """Auto-select best available compute device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    # MPS (Apple Silicon) has tensor stride incompatibilities with WiLoR's ViT backbone
+    # — fall back to CPU
+    return "cpu"
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
 
-def draw_hand(canvas: np.ndarray, landmarks, width: int, height: int, mode: str) -> None:
-    """Draw skeleton connections and landmark dots for one detected hand."""
-    pts = [(int(lm.x * width), int(lm.y * height)) for lm in landmarks]
+def draw_hand(canvas: np.ndarray, keypoints_2d: np.ndarray, mode: str) -> None:
+    """Draw skeleton connections and landmark dots for one detected hand.
+
+    Args:
+        canvas: BGR image to draw onto (modified in-place).
+        keypoints_2d: Array of shape [21, 2] in pixel coordinates.
+        mode: 'overlay' or 'wireframe'.
+    """
+    pts = [(int(kp[0]), int(kp[1])) for kp in keypoints_2d]
 
     line_color = (255, 255, 255) if mode == "overlay" else (0, 200, 255)
     dot_color  = (0, 255, 0)     if mode == "overlay" else (0, 255, 128)
@@ -88,12 +86,11 @@ def draw_hand(canvas: np.ndarray, landmarks, width: int, height: int, mode: str)
 def process_video(
     input_path: Path,
     output_path: Path,
-    model_path: str,
+    pipe: WiLorHandPose3dEstimationPipeline,
     mode: str,
     max_hands: int,
-    confidence: float,
 ) -> bool:
-    """Process a single video through hand tracking and write the output."""
+    """Process a single video through WiLoR hand tracking and write the output."""
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video: {input_path}", file=sys.stderr)
@@ -113,48 +110,28 @@ def process_video(
         cap.release()
         return False
 
-    base_options = mp_python.BaseOptions(
-        model_asset_path=model_path,
-        delegate=mp_python.BaseOptions.Delegate.CPU,  # force CPU; GPU requires a display context
-    )
-    options = mp_vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=max_hands,
-        min_hand_detection_confidence=confidence,
-        min_tracking_confidence=confidence,
-        running_mode=mp_vision.RunningMode.VIDEO,  # frame-by-frame, no callback
-    )
-
     hands_detected_frames = 0
-    frame_index = 0
 
-    with mp_vision.HandLandmarker.create_from_options(options) as detector:
-        with tqdm(total=total_frames, desc=input_path.name, unit="frame") as pbar:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+    with tqdm(total=total_frames, desc=input_path.name, unit="frame") as pbar:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            # WiLoR-mini accepts a BGR numpy array (same as cv2 output)
+            outputs = pipe.predict(frame)
 
-                # VIDEO mode requires monotonically increasing timestamps in ms
-                timestamp_ms = int((frame_index / fps) * 1000)
-                result = detector.detect_for_video(mp_image, timestamp_ms)
+            canvas = np.zeros_like(frame) if mode == "wireframe" else frame.copy()
 
-                if mode == "wireframe":
-                    canvas = np.zeros((height, width, 3), dtype=np.uint8)
-                else:
-                    canvas = frame.copy()
+            if outputs:
+                hands_detected_frames += 1
+                for out in outputs[:max_hands]:
+                    # keypoints_2d[0] → shape [21, 2], already in pixel coordinates
+                    keypoints_2d = out["wilor_preds"]["pred_keypoints_2d"][0]
+                    draw_hand(canvas, keypoints_2d, mode)
 
-                if result.hand_landmarks:
-                    hands_detected_frames += 1
-                    for hand_landmarks in result.hand_landmarks:
-                        draw_hand(canvas, hand_landmarks, width, height, mode)
-
-                writer.write(canvas)
-                frame_index += 1
-                pbar.update(1)
+            writer.write(canvas)
+            pbar.update(1)
 
     cap.release()
     writer.release()
@@ -175,7 +152,7 @@ def collect_videos(input_path: Path) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run hand tracking on videos and output wireframe overlays.",
+        description="Run WiLoR hand tracking on videos and output wireframe overlays.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -186,9 +163,7 @@ def main():
         help="'overlay': wireframe on original (default). 'wireframe': skeleton on black.",
     )
     parser.add_argument("--max-hands", type=int, default=2, metavar="N",
-                        help="Max hands to detect per frame (default: 2).")
-    parser.add_argument("--confidence", type=float, default=0.5, metavar="F",
-                        help="Min detection/tracking confidence 0–1 (default: 0.5).")
+                        help="Max hands to draw per frame (default: 2).")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -196,7 +171,12 @@ def main():
         print(f"[ERROR] Input path does not exist: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    model_path = ensure_model()
+    device = get_device()
+    # Use float32 on MPS/CPU for stability; float16 only on CUDA
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"Device: {device}  |  dtype: {dtype}")
+    print("Loading WiLoR model (weights download on first run)…\n")
+    pipe = WiLorHandPose3dEstimationPipeline(device=device, dtype=dtype)
 
     videos = collect_videos(input_path)
     if not videos:
@@ -204,8 +184,7 @@ def main():
         sys.exit(1)
 
     is_batch = len(videos) > 1 or input_path.is_dir()
-    print(f"Found {len(videos)} video(s)  |  mode: {args.mode}  |  "
-          f"max hands: {args.max_hands}  |  confidence: {args.confidence}\n")
+    print(f"Found {len(videos)} video(s)  |  mode: {args.mode}  |  max hands: {args.max_hands}\n")
 
     success_count = 0
     for video in videos:
@@ -218,7 +197,7 @@ def main():
                 video.stem + "_tracked" + video.suffix
             )
 
-        if process_video(video, out_path, model_path, args.mode, args.max_hands, args.confidence):
+        if process_video(video, out_path, pipe, args.mode, args.max_hands):
             success_count += 1
 
     print(f"\nDone. {success_count}/{len(videos)} video(s) processed successfully.")
